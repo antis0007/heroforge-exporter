@@ -84,6 +84,26 @@ interface Skeleton {
   boneInverses: Matrix4[]
   update?(): void
 }
+interface TextureLike {
+  name?: string
+  image?: HTMLImageElement | HTMLCanvasElement | ImageBitmap | OffscreenCanvas | { width: number; height: number } | null
+  source?: { data?: HTMLImageElement | HTMLCanvasElement | ImageBitmap | null } // some engines wrap it
+  userData?: any
+  uuid?: string
+}
+
+interface MaterialLike {
+  name?: string
+  map?: TextureLike | null
+  normalMap?: TextureLike | null
+  roughnessMap?: TextureLike | null
+  metalnessMap?: TextureLike | null
+  aoMap?: TextureLike | null
+  emissiveMap?: TextureLike | null
+  alphaMap?: TextureLike | null
+  // Some renderers store colors/params too, but optional
+  [key: string]: any
+}
 
 interface Mesh {
   isMesh: boolean
@@ -97,6 +117,7 @@ interface Mesh {
   bindMatrixInverse?: Matrix4
   morphTargetInfluences?: number[]
   children?: Mesh[]
+  material?: MaterialLike | MaterialLike[]
   updateMatrixWorld(force: boolean): void
 }
 
@@ -116,6 +137,9 @@ interface ExportOptions {
   filename?: string
   scale?: number
   separateBase?: boolean
+  format?: 'stl' | 'obj'
+  includeTextures?: boolean
+  includeNormals?: boolean
 }
 
 interface CollectedMeshes {
@@ -582,6 +606,271 @@ function extractMeshGeometry(mesh: Mesh): ExtractedGeometry {
 
   return { positions, indices }
 }
+interface ExtractedGeometryExtended extends ExtractedGeometry {
+  uvs: number[] | null
+}
+
+function extractMeshGeometryExtended(mesh: Mesh): ExtractedGeometryExtended {
+  const base = extractMeshGeometry(mesh)
+
+  const uvAttr = mesh.geometry.attributes['uv'] as BufferAttribute | undefined
+  let uvs: number[] | null = null
+  if (uvAttr && uvAttr.count > 0) {
+    // uv is 2 components; BufferAttribute interface only exposes getX/getY so that’s fine
+    uvs = new Array(uvAttr.count * 2)
+    for (let i = 0; i < uvAttr.count; i++) {
+      uvs[i * 2] = uvAttr.getX(i)
+      uvs[i * 2 + 1] = uvAttr.getY(i)
+    }
+  }
+
+  return { ...base, uvs }
+}
+
+function pickMaterial(mesh: Mesh): MaterialLike | null {
+  const mat = mesh.material
+  if (!mat) return null
+  return Array.isArray(mat) ? (mat[0] || null) : mat
+}
+
+function safeMaterialName(mat: MaterialLike | null, fallback: string): string {
+  const raw = (mat?.name || fallback || 'material').trim()
+  return raw.replace(/[^\w\-]+/g, '_')
+}
+
+function getTextureSlots(mat: MaterialLike | null): Array<{ slot: string; tex: TextureLike }> {
+  if (!mat) return []
+  const slots = ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap', 'alphaMap']
+  const out: Array<{ slot: string; tex: TextureLike }> = []
+  for (const s of slots) {
+    const t = mat[s]
+    if (t && typeof t === 'object') out.push({ slot: s, tex: t })
+  }
+  return out
+}
+async function textureToPNG(tex: TextureLike): Promise<ArrayBuffer | null> {
+  try {
+    const img =
+      (tex?.image as any) ||
+      (tex?.source?.data as any) ||
+      null
+
+    if (!img) return null
+
+    // Determine dimensions
+    const w = (img.width ?? img.videoWidth ?? img.naturalWidth) || 0
+    const h = (img.height ?? img.videoHeight ?? img.naturalHeight) || 0
+    if (!w || !h) return null
+
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+
+    // Draw supported image-like types
+    // HTMLImageElement/HTMLCanvasElement/ImageBitmap are handled by drawImage
+    ctx.drawImage(img as any, 0, 0, w, h)
+
+    const blob: Blob = await new Promise((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png')
+    })
+
+    return await blob.arrayBuffer()
+  } catch (e) {
+    console.warn('Failed to convert texture to PNG:', e)
+    return null
+  }
+}
+// Compute a face normal for OBJ normals (same as your STL normal calc)
+function faceNormal(a: Vertex, b: Vertex, c: Vertex): Vertex {
+  return calculateNormal(a, b, c)
+}
+
+function buildOBJFromMeshes(
+  meshes: Mesh[],
+  filenameBase: string,
+  scale: number,
+  includeNormals: boolean
+): { obj: string; groups: Array<{ materialName: string; faces: string[] }>; v: Vertex[]; vt: { u: number; v: number }[]; vn: Vertex[] } {
+  // We’ll build unified OBJ buffers and keep per-mesh material group faces.
+  const v: Vertex[] = []
+  const vt: { u: number; v: number }[] = []
+  const vn: Vertex[] = []
+
+  const groups: Array<{ materialName: string; faces: string[] }> = []
+
+  for (const mesh of meshes) {
+    const { positions, indices, uvs } = extractMeshGeometryExtended(mesh)
+
+    // Build vertices (apply same orientation/ground as STL later, but we’ll do per-vertex transform now)
+    const verts: Vertex[] = []
+    for (let i = 0; i < positions.length; i += 3) {
+      const x = positions[i]
+      const y = positions[i + 1]
+      const z = positions[i + 2]
+
+      // Match your STL transform: (x, y, z) -> (x, -z, y) and scale
+      const tx = x * scale
+      const ty = -z * scale
+      const tz = y * scale
+      verts.push({ x: tx, y: ty, z: tz })
+    }
+
+    // Determine minZ for ground offset similar to STL.
+    // We can do a global ground shift across all meshes after concatenation,
+    // but easiest is: push verts first and ground-shift globally after.
+    // So: push as-is, then we’ll ground-shift all at the end.
+    const meshVStart = v.length
+    v.push(...verts)
+
+    // UVs
+    let meshVTStart = vt.length
+    if (uvs) {
+      for (let i = 0; i < uvs.length; i += 2) {
+        // OBJ vt v-axis is often flipped depending on convention; many engines use v=1-v.
+        // We’ll keep as-is; if upside down, change to (1 - uvs[i+1]).
+        vt.push({ u: uvs[i], v: uvs[i + 1] })
+      }
+    } else {
+      meshVTStart = -1
+    }
+
+    // Faces grouped by material
+    const mat = pickMaterial(mesh)
+    const matName = safeMaterialName(mat, mesh.name || 'mesh')
+
+    const faces: string[] = []
+
+    const addFace = (i0: number, i1: number, i2: number): void => {
+      // Vertex indices
+      const a = meshVStart + i0 + 1
+      const b = meshVStart + i1 + 1
+      const c = meshVStart + i2 + 1
+
+      // UV indices (if present)
+      const ta = uvs ? (meshVTStart + i0 + 1) : 0
+      const tb = uvs ? (meshVTStart + i1 + 1) : 0
+      const tc = uvs ? (meshVTStart + i2 + 1) : 0
+
+      if (includeNormals) {
+        // Compute a per-face normal and store 1 normal per face
+        const na = v[meshVStart + i0]
+        const nb = v[meshVStart + i1]
+        const nc = v[meshVStart + i2]
+        const n = faceNormal(na, nb, nc)
+        vn.push(n)
+        const nIdx = vn.length // 1-based
+
+        if (uvs) {
+          faces.push(`f ${a}/${ta}/${nIdx} ${b}/${tb}/${nIdx} ${c}/${tc}/${nIdx}`)
+        } else {
+          faces.push(`f ${a}//${nIdx} ${b}//${nIdx} ${c}//${nIdx}`)
+        }
+      } else {
+        if (uvs) {
+          faces.push(`f ${a}/${ta} ${b}/${tb} ${c}/${tc}`)
+        } else {
+          faces.push(`f ${a} ${b} ${c}`)
+        }
+      }
+    }
+
+    if (indices) {
+      for (let i = 0; i < indices.length; i += 3) {
+        addFace(indices[i], indices[i + 1], indices[i + 2])
+      }
+    } else {
+      const vertCount = verts.length
+      for (let i = 0; i < vertCount; i += 3) {
+        addFace(i, i + 1, i + 2)
+      }
+    }
+
+    groups.push({ materialName: matName, faces })
+  }
+
+  // Global ground-plane lift (same as STL): zOffset = -minZ + 2.5
+  let minZ = Number.POSITIVE_INFINITY
+  for (const p of v) minZ = Math.min(minZ, p.z)
+  const zOffset = -minZ + 2.5
+  for (const p of v) p.z += zOffset
+
+  // Build OBJ text
+  let obj = `# HeroForge Export\n`
+  obj += `mtllib ${filenameBase}.mtl\n`
+  obj += `\n`
+
+  for (const p of v) obj += `v ${p.x} ${p.y} ${p.z}\n`
+  obj += `\n`
+
+  for (const t of vt) obj += `vt ${t.u} ${t.v}\n`
+  obj += `\n`
+
+  if (includeNormals) {
+    for (const n of vn) obj += `vn ${n.x} ${n.y} ${n.z}\n`
+    obj += `\n`
+  }
+
+  for (const g of groups) {
+    obj += `g ${g.materialName}\n`
+    obj += `usemtl ${g.materialName}\n`
+    for (const f of g.faces) obj += `${f}\n`
+    obj += `\n`
+  }
+
+  return { obj, groups, v, vt, vn }
+}
+
+function buildMTLForMeshes(
+  meshes: Mesh[],
+  textureDir = 'textures'
+): { mtl: string; textures: Array<{ path: string; tex: TextureLike }> } {
+  const seen = new Set<string>()
+  const texOutputs: Array<{ path: string; tex: TextureLike }> = []
+
+  let mtl = `# HeroForge Export\n\n`
+
+  for (const mesh of meshes) {
+    const mat = pickMaterial(mesh)
+    if (!mat) continue
+
+    const matName = safeMaterialName(mat, mesh.name || 'mesh')
+    if (seen.has(matName)) continue
+    seen.add(matName)
+
+    mtl += `newmtl ${matName}\n`
+    // Basic defaults (fine for most viewers)
+    mtl += `Ka 1.000 1.000 1.000\n`
+    mtl += `Kd 1.000 1.000 1.000\n`
+    mtl += `Ks 0.000 0.000 0.000\n`
+    mtl += `d 1.000\n`
+    mtl += `illum 2\n`
+
+    const slots = getTextureSlots(mat)
+    for (const { slot, tex } of slots) {
+      const baseName = (tex.name || tex.uuid || `${matName}_${slot}`).toString().replace(/[^\w\-]+/g, '_')
+      const fileName = `${baseName}.png`
+      const path = `${textureDir}/${fileName}`
+
+      // Map only some slots to standard MTL keywords.
+      // 'map_Kd' = diffuse/albedo
+      // 'map_Bump' = normal/bump (MTL doesn’t standardize normal maps well)
+      if (slot === 'map') mtl += `map_Kd ${path}\n`
+      else if (slot === 'normalMap') mtl += `map_Bump ${path}\n`
+      else if (slot === 'alphaMap') mtl += `map_d ${path}\n`
+      else if (slot === 'emissiveMap') mtl += `map_Ke ${path}\n`
+      // roughness/metalness/ao aren’t standard in classic MTL; we still export them as files
+      // and you can manually wire them in modern tools if needed.
+
+      texOutputs.push({ path, tex })
+    }
+
+    mtl += `\n`
+  }
+
+  return { mtl, textures: texOutputs }
+}
 
 /**
  * Check if a vertex has valid coordinates
@@ -772,8 +1061,15 @@ function downloadFile(buffer: ArrayBuffer, filename: string): void {
  * @param options.scale - Scale factor (default: 10 to match HeroForge export size)
  * @param options.separateBase - Export base and character separately in a ZIP (default: true)
  */
-export function exportCharacter(options: ExportOptions = {}): void {
-  const { filename = 'heroforge-character', scale = 10, separateBase = true } = options
+export async function exportCharacter(options: ExportOptions = {}): Promise<void> {
+  const {
+    filename = 'heroforge-character',
+    scale = 10,
+    separateBase = true,
+    format = 'stl',
+    includeTextures = true,
+    includeNormals = false,
+  } = options
 
   console.log('Starting HeroForge character export...')
   console.log(`  Scale: ${scale}x`)
@@ -787,56 +1083,94 @@ export function exportCharacter(options: ExportOptions = {}): void {
   if (CK.scene) {
     CK.scene.updateMatrixWorld(true)
   }
-
   const { characterMeshes, baseMeshes } = collectMeshes()
-
   if (characterMeshes.length === 0 && baseMeshes.length === 0) {
     console.error('No meshes found.')
     return
   }
 
-  console.log('Applying bone transforms...')
+  // If we’re exporting textures or multiple outputs, prefer ZIP
+  const needsZip = separateBase || includeTextures || format === 'obj'
 
-  if (separateBase && baseMeshes.length > 0) {
-    // Export as ZIP with separate files
+  if (needsZip) {
     const zip = new SimpleZip()
 
-    // Process character meshes
+    const addSTL = (meshes: Mesh[], label: string, outName: string) => {
+      const tris = collectTriangles(meshes)
+      transformTriangles(tris, scale)
+      const stl = trianglesToSTL(tris, label)
+      zip.addFile(outName, stl)
+      console.log(`${label}: ${tris.length} triangles`)
+    }
+
+    const addOBJ = async (meshes: Mesh[], outBaseName: string) => {
+      const objBase = outBaseName.replace(/\.obj$/i, '')
+      const objRes = buildOBJFromMeshes(meshes, `${objBase}`, scale, includeNormals)
+
+      // MTL + textures
+      let mtlText: string | null = null
+      if (includeTextures) {
+        const mtlRes = buildMTLForMeshes(meshes, 'textures')
+        mtlText = mtlRes.mtl
+        zip.addFile(`${objBase}.mtl`, new TextEncoder().encode(mtlText).buffer)
+
+        // Convert textures to PNGs
+        // Deduplicate by path
+        const seenPaths = new Set<string>()
+        for (const t of mtlRes.textures) {
+          if (seenPaths.has(t.path)) continue
+          seenPaths.add(t.path)
+
+          const png = await textureToPNG(t.tex)
+          if (png) zip.addFile(t.path, png)
+        }
+      } else {
+        // still add a stub MTL if you want; or omit. We'll omit.
+      }
+
+      zip.addFile(`${objBase}.obj`, new TextEncoder().encode(objRes.obj).buffer)
+    }
+
+    // Character
     if (characterMeshes.length > 0) {
-      const charTriangles = collectTriangles(characterMeshes)
-      transformTriangles(charTriangles, scale)
-      const charSTL = trianglesToSTL(charTriangles, 'HeroForge Character')
-      zip.addFile(`${filename}-character.stl`, charSTL)
-      console.log(`Character: ${charTriangles.length} triangles`)
+      if (format === 'stl') addSTL(characterMeshes, 'HeroForge Character', `${filename}-character.stl`)
+      else await addOBJ(characterMeshes, `${filename}-character`)
     }
 
-    // Process base meshes
+    // Base
     if (baseMeshes.length > 0) {
-      const baseTriangles = collectTriangles(baseMeshes)
-      transformTriangles(baseTriangles, scale)
-      const baseSTL = trianglesToSTL(baseTriangles, 'HeroForge Base')
-      zip.addFile(`${filename}-base.stl`, baseSTL)
-      console.log(`Base: ${baseTriangles.length} triangles`)
+      if (format === 'stl') addSTL(baseMeshes, 'HeroForge Base', `${filename}-base.stl`)
+      else await addOBJ(baseMeshes, `${filename}-base`)
     }
 
-    // Generate and download ZIP
+    // If format is STL but includeTextures=true, dump textures anyway (no binding)
+    if (format === 'stl' && includeTextures) {
+      const allMeshes = [...characterMeshes, ...baseMeshes]
+      const mtlRes = buildMTLForMeshes(allMeshes, 'textures')
+      // Include a “materials” file so you at least see what was found
+      zip.addFile(`${filename}-materials.mtl`, new TextEncoder().encode(mtlRes.mtl).buffer)
+
+      const seenPaths = new Set<string>()
+      for (const t of mtlRes.textures) {
+        if (seenPaths.has(t.path)) continue
+        seenPaths.add(t.path)
+        const png = await textureToPNG(t.tex)
+        if (png) zip.addFile(t.path, png)
+      }
+    }
+
     const zipBuffer = zip.generate()
     downloadFile(zipBuffer, `${filename}.zip`)
-
     console.log(`Export complete! Downloaded ${filename}.zip`)
-  } else {
-    // Export as single STL (combine all meshes)
-    const allMeshes = [...characterMeshes, ...baseMeshes]
-    const triangles = collectTriangles(allMeshes)
-    transformTriangles(triangles, scale)
-
-    console.log(`Total triangles: ${triangles.length}`)
-
-    const stlBuffer = trianglesToSTL(triangles)
-    downloadFile(stlBuffer, `${filename}.stl`)
-
-    console.log(`Export complete! ${triangles.length} triangles, ${(stlBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`)
+    return
   }
+
+  // Non-zip single STL path (your old behavior)
+  const allMeshes = [...characterMeshes, ...baseMeshes]
+  const triangles = collectTriangles(allMeshes)
+  transformTriangles(triangles, scale)
+  const stlBuffer = trianglesToSTL(triangles)
+  downloadFile(stlBuffer, `${filename}.stl`)
 }
 
 // Export types for module consumers
